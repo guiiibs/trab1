@@ -1,0 +1,442 @@
+#include "rawSocket.h"
+
+void imprime_mensagem(mensagem *m) {
+	int i = 0;
+	printf("\n----------------------------------------\n");
+	printf("| %d | %d | %d | %d | %d |", m->inicio, m->tamanho, m->sequencia,
+			m->tipo, m->paridade);
+
+	for (; i < m->tamanho; i++) {
+		printf("%c", m->dados[i]);
+	}
+
+	for (; i < MAX_DADOS; i++) {
+		printf(" ");
+	}
+
+	printf("|\n");
+	printf("----------------------------------------\n");
+}
+
+char * call_getcwd(void) {
+	char * cwd;
+	cwd = getcwd(0, 0);
+	if (!cwd) {
+		//fprintf (stderr, "getcwd failed: %s\n", strerror (errno));
+		return strerror(errno);
+	} else {
+		return cwd;
+		//printf ("%s\n", cwd);
+		//free (cwd);
+	}
+}
+
+void habilitar_camada_rede(void) {
+	system("ifconfig eth0 promisc");
+	fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+	setar_endereco(); //&sockAdd
+	p.fd = fd;
+	p.events = POLLIN;
+	rede_habilitada = 1;
+}
+
+void desabilitar_camada_rede(void) {
+	close(fd);
+	system("ifconfig eth0 -promisc");
+	rede_habilitada = 0;
+}
+
+void setar_endereco(void) {
+	memset(&enderecoSocket, 0, sizeof(endereco));
+	enderecoSocket.sll_family = AF_PACKET;
+	enderecoSocket.sll_protocol = htons(ETH_P_ALL);
+	enderecoSocket.sll_pkttype = PACKET_OTHERHOST;
+	enderecoSocket.sll_ifindex = 2;
+	enderecoSocket.sll_hatype = ARPHRD_ETHER;
+	enderecoSocket.sll_halen = ETH_ALEN;
+	enderecoSocket.sll_addr[0] = 0x54 ;
+	enderecoSocket.sll_addr[1] = 0x04 ;
+	enderecoSocket.sll_addr[2] = 0xA6 ;
+	enderecoSocket.sll_addr[3] = 0x2C ;
+	enderecoSocket.sll_addr[4] = 0x57 ;
+	enderecoSocket.sll_addr[5] = 0x1F ;
+	enderecoSocket.sll_addr[6] = 0x00 ;   //nao usados//
+	enderecoSocket.sll_addr[7] = 0x00 ;   /////////////
+}
+
+void exibe_erro(mensagem *m) {
+	char erro = m->dados[0];
+
+	switch (erro) {
+	case '0':
+		printf("Diretório inexistente.\n");
+		break;
+	case '1':
+		printf("Permissão negada.\n");
+		break;
+	case '2':
+		printf("Espaço insuficiente.\n");
+		break;
+	case '3':
+		printf("Arquivo inexistente.\n");
+		break;
+	case '4':
+		printf("Arquivo com tamanho maior do que o máximo.\n");
+		break;
+	default:
+		printf("Erro com código inexistente (%c). Não era pra aconter isso!\n", erro);
+		break;
+	}
+}
+
+void espera_resposta(tipoEvento *evento, mensagem *m, mensagem *r) {
+	//printf("aguardando resposta...\n");
+	tentativas = 0;
+	int acabou = 0;
+	int pa;
+	byte paridade;
+
+	do {
+		pa = poll(&p, 1, 1000);
+		switch (pa) {
+		case 0:
+			printf("timeout %d\n", tentativas++);
+			envia_mensagem(m);
+			if (tentativas >= MAX_TENTATIVAS) {
+				*evento = timeout;
+				acabou = 1;
+			}
+			break;
+		case -1:
+			printf("Erro ao executar a função poll\n");
+			exit(-1);
+		default:
+			if (p.revents == POLLIN) { //se recebeu algo
+				result_receber = recv(fd, buffer, MAX_MSG, 0);
+				fsync(fd);
+				if (buffer[0] == 0x7E) {
+					//------- recupera a mensagem ------------
+					r->inicio = buffer[0];
+					r->tamanho = (buffer[1] << 4) >> 4;
+					r->sequencia = buffer[1] >> 4;
+					r->tipo = (buffer[2] << 4) >> 4;
+					r->paridade = buffer[2] >> 4;
+					pa = 0;
+					for (; pa < MAX_DADOS; pa++) {
+						r->dados[pa] = buffer[pa + 3];
+					}
+					//------ fim recupera mensagem -----------
+
+					acabou = 1;
+					paridade = calcula_paridade(r);
+					if (paridade == r->paridade) {
+						*evento = mensagemRecebida;
+					} else {
+						*evento = error;
+					}
+				} else {
+					*evento = lixo;
+				}
+			}
+			break;
+		}
+	} while (!acabou);
+}
+
+void espera_evento(tipoEvento *evento, mensagem *r) {
+	byte paridade;
+	int i;
+
+	result_receber = recv(fd, buffer, MAX_MSG, 0);
+
+	if (buffer[0] == 0x7E) {
+		//------- recupera a mensagem ------------
+		r->inicio = buffer[0];
+		r->tamanho = (buffer[1] << 4) >> 4;
+		r->sequencia = buffer[1] >> 4;
+		r->tipo = (buffer[2] << 4) >> 4;
+		r->paridade = buffer[2] >> 4;
+		i = 0;
+		for (; i < MAX_DADOS; i++) {
+			r->dados[i] = buffer[i + 3];
+		}
+		//------ fim recupera mensagem -----------
+		paridade = calcula_paridade(r);
+		if (paridade == r->paridade) {
+			*evento = mensagemRecebida;
+		} else {
+			*evento = error;
+		}
+	} else {
+		*evento = lixo;
+	}
+}
+
+void recupera_mensagem(mensagem *m) {
+	int i;
+/*
+	m->inicio = buffer[0];
+	m->tamanho = (buffer[1] << 4) >> 4;
+	m->sequencia = buffer[1] >> 4;
+	m->tipo = (buffer[2] << 4) >> 4;
+	m->paridade = buffer[2] >> 4;
+	i = 0;
+	for (; i < MAX_DADOS; i++) {
+		m->dados[i] = buffer[i + 3];
+	}
+	*/
+	m->inicio = buffer[0];
+	m->tamanho = buffer[1];
+	m->sequencia = buffer[2];
+	m->tipo = buffer[3];
+	m->paridade = buffer[4];
+
+	for (; i < MAX_DADOS; i++) {
+		m->dados[i] = buffer[i + 5];
+	}
+
+	//printf("recuperou mensagem:");
+	//imprime_mensagem(m);
+}
+
+void envia_mensagem(mensagem *m) {
+//	memcpy(buffer, m, sizeof(m));
+//	m->parity = calcula_paridade(); Implementar isso -> paridade vai ser calculada no cria mensagem
+	//printf("mensagem enviada:");
+	//printf("enviou:\n");
+	//imprime_mensagem(m);
+	result_enviar = sendto(fd, m, MAX_MSG, 0, (struct sockaddr *) &enderecoSocket, sizeof(endereco));
+}
+
+byte calcula_paridade(mensagem *m) {
+	int i;
+	byte b = 0, byte1 = 255; //byte1 == byte com todos os bits 1
+
+	//faz xor dos campos
+	b = m->tamanho ^ m->sequencia ^ m->tipo;
+	for (i = 0; i < m->tamanho; i++) {
+		b ^= m->dados[i] >> 4;
+		b ^= m->dados[i];
+	}
+
+	//inverte resultado do xor
+	b ^= byte1;
+
+	b = b << 4;
+	b = b >> 4;
+
+	return b;
+}
+
+void cria_mensagem(mensagem *m, byte sequencia, byte tipo, char *dados) {
+	int i = 0;
+
+	m->inicio = byteInicio;
+	m->tamanho = (short) strlen(dados);
+	m->sequencia = sequencia;
+	m->tipo = tipo;
+	m->paridade = 0; //tem que implementar o cálculo da paridade
+
+	for (; i < MAX_DADOS; i++) {
+		m->dados[i] = dados[i];
+	}
+
+	m->paridade = calcula_paridade(m);
+}
+
+void incrementa_sequencia(byte *seq) {
+	if (*seq < MAX_SEQ) {
+		++(*seq);
+	} else {
+		*seq = 0;
+	}
+}
+
+long calcula_tamanho_arquivo(char *nome) {
+	long long lSize;
+	FILE *fp = fopen(nome, "r");
+
+	if (fp == NULL) {
+		return -1;
+	}
+
+	//busca tamanho do arquivo
+	fseek(fp, 0L, SEEK_END);
+	lSize = ftell(fp);
+	//volta ponteiro para o inicio do arquivo
+	rewind(fp);
+	fclose(fp);
+
+	return lSize;
+}
+
+char * le_arquivo(char *nome) {
+	long long lSize;
+	char *arquivo;
+	FILE *fp = fopen(nome, "r");
+
+	if (fp == NULL) {
+		exit(-1);
+		//return -1;
+	}
+
+	//busca tamanho do arquivo
+	fseek(fp, 0L, SEEK_END);
+	lSize = ftell(fp);
+	//volta ponteiro para o inicio do arquivo
+	rewind(fp);
+
+	arquivo = (char *) malloc(lSize);
+	fread(arquivo, 1, lSize, fp);
+
+	fclose(fp);
+
+	return arquivo;
+}
+
+
+void recebe_arquivo(mensagem *m, char *nome, byte tipo, byte prox_enviar, byte prox_receber) {
+	mensagem r;
+	tipoEvento evento;
+	int fim = 0;
+	//byte prox_receber = 0, prox_enviar = 1;
+	FILE *fp;
+
+	if (tipo == DADOS) {
+		fp = fopen(nome, "w"); //abre o arquivo
+		chmod(nome, (S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH|S_IWOTH)); //seta as permissões
+	}
+
+	do {
+		espera_resposta(&evento, m, &r); //espera uma resposta
+		if (evento == mensagemRecebida) { //se o evento recebido for uma mensagem com preâmbulo correto
+			if (r.sequencia == prox_receber) { //se a sequência for a esperada
+				//se (tipo EXIBE e estou esperando uma EXIBE) OU (tipo DADOS e estou esperando uma DADOS)
+				if ((r.tipo == EXIBE && tipo == EXIBE) || (r.tipo == DADOS && tipo == DADOS)) {
+					if (tipo == EXIBE) { //se for do tipo EXIBE
+						fwrite(r.dados, r.tamanho, 1, stdout); //escreve os dados na tela
+					} else { //se for do tipo DADOS
+						fwrite(r.dados, r.tamanho, 1, fp); //escreve os dados no arquivo
+					}
+					cria_mensagem(m, prox_enviar, ACK, ""); //cria um ACK
+					envia_mensagem(m); //envia o ACK
+					incrementa_sequencia(&prox_enviar); //incrementa prox_enviar e prox_receber
+					incrementa_sequencia(&prox_receber);
+				} else if (r.tipo == FIM_ARQ) { //se for do tipo FIM_ARQ
+					fim = 1; //sai do while
+					cria_mensagem(m, prox_enviar, ACK, "");
+					envia_mensagem(m);
+				} else if (r.tipo == NACK) { //se for do tipo NACK
+					envia_mensagem(m); //envia a mesma mensagem novamente
+					incrementa_sequencia(&prox_receber); //incrementa só a prox_receber
+				} else if (r.tipo == ERRO) {
+					cria_mensagem(m, prox_enviar, ACK, "");
+					envia_mensagem(m);
+					fim = 1;
+					exibe_erro(&r);
+				} else {
+					//a princípio não faz nada se não for do tipo correto (acho que pode ser lixo)
+				}
+			} else if (r.sequencia > prox_receber) { //se a sequência for maior do que a esperada
+				fim = 1; //sai do while
+				printf("Mensagem com sequência maior do que a esperada, encerrando a transmissão...\n seq: %d e esperava: %d\n", r.sequencia, prox_receber);
+			}
+		} else if (evento == timeout) { //se o evento for um timeout
+			fim = 1; //sai do while
+			printf("Timeout, comando não executado...\n");
+		} else if (evento == error) {
+			cria_mensagem(m, prox_enviar, NACK, "");
+			envia_mensagem(m);
+			incrementa_sequencia(&prox_enviar); //incrementa prox_enviar e prox_receber
+			incrementa_sequencia(&prox_receber);
+		}
+	} while (!fim);
+
+	if (tipo == DADOS) {
+		fclose(fp);
+	}
+}
+
+
+void envia_arquivo(char *nome, byte tipo, byte prox_enviar, byte prox_receber) {
+	char *argumento = (char *) malloc(MAX_DADOS + 1);
+	int j, fim, enviouTodoArquivo = 0, enviouFimArquivo = 0;
+	char *arquivo;
+	tipoEvento evento;
+	mensagem m, r;
+	//byte prox_enviar = 0, prox_receber = 1;
+	long long tamArquivo, i = 0;
+
+	//lê o arquivo com o resultado do ls
+	arquivo = le_arquivo(nome);
+	tamArquivo = strlen(arquivo);
+	if (tipo == EXIBE) {
+		tamArquivo--; //para não mostrar na tela o char terminador de arquivo
+	}
+
+	i = 0;
+	fim = 0;
+	j = 0;
+
+	//copia os 15 primeiros caracteres do arquivo para a variável argumento
+	for (; i < MAX_DADOS && i < tamArquivo; i++) {
+		argumento[j++] = arquivo[i];
+	}
+	argumento[j] = '\0';
+
+	cria_mensagem(&m, prox_enviar, tipo, argumento); //cria mensagem do tipo EXIBE
+	envia_mensagem(&m); //envia
+	incrementa_sequencia(&prox_enviar); //incrementa prox_enviar
+
+	do {
+		//verifica se mandou todo o arquivo
+		if (i >= tamArquivo) {
+			enviouTodoArquivo = 1;
+		}
+
+		espera_resposta(&evento, &m, &r); //espera uma resposta
+		if (evento == mensagemRecebida) { //se o evento recebido for uma mensagem recebida
+			if (r.sequencia == prox_receber) { //se a mensagem for da sequência correta
+				if (r.tipo == ACK && !enviouTodoArquivo) { //se for um ACK e ainda não enviou todo o arquivo, envia os próximos caracteres
+					j = 0;
+					//copia os próximos 15 caracteres
+					while (j < MAX_DADOS && i < tamArquivo) {
+						argumento[j++] = arquivo[i++];
+					}
+					argumento[j] = '\0';
+
+					cria_mensagem(&m, prox_enviar, tipo, argumento); //cria mensagem do tipo EXIBE
+					envia_mensagem(&m); //envia
+					incrementa_sequencia(&prox_enviar); //incrementa prox_enviar e prox_receber
+					incrementa_sequencia(&prox_receber);
+				} else if (r.tipo == ACK && enviouTodoArquivo && !enviouFimArquivo) { //se for ACK E envitou todo arquivo E não enviou fim de arquivo
+					cria_mensagem(&m, prox_enviar, FIM_ARQ, ""); //cria mensagem do tipo FIM_ARQ
+					envia_mensagem(&m); //envia mensagem
+					enviouFimArquivo = 1;
+					incrementa_sequencia(&prox_enviar); //incrementa prox_enviar e prox_receber
+					incrementa_sequencia(&prox_receber);
+				} else if (r.tipo == ACK && enviouTodoArquivo && enviouFimArquivo) { //se for ACK E envitou todo arquivo E enviou fim de arquivo
+					fim = 1;
+				} else if (r.tipo == NACK) { //se for do tipo NACK
+					envia_mensagem(&m); //envia a mesma mensagem novamente
+					incrementa_sequencia(&prox_receber); //incrementa só a prox_receber
+				}
+				else {
+					//a princípio não faz nada se não for do tipo correto (acho que pode ser lixo)
+				}
+			} else if (r.sequencia > prox_receber) { //se a sequência for maior do que a esperada
+				fim = 1; //sai do while
+				printf("Mensagem com sequência maior do que a esperada, encerrando a transmissão...\n seq: %d e esperava: %d\n", r.sequencia, prox_receber);
+			}
+		} else if (evento == timeout) { //se o evento for um timeout
+			fim = 1; //sai do while
+			printf("Timeout, comando não executado...\n");
+		} else if (evento == error) {
+			cria_mensagem(&m, prox_enviar, NACK, "");
+			envia_mensagem(&m);
+			incrementa_sequencia(&prox_enviar); //incrementa prox_enviar e prox_receber
+			incrementa_sequencia(&prox_receber);
+		}
+	} while(!fim);
+	//sai do while quando enviar todo o arquivo
+}
